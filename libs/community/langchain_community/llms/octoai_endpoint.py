@@ -1,9 +1,18 @@
-from typing import Any, Dict, List, Mapping, Optional
+from typing import (
+    Any,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Set,
+)
 
 from langchain_core.callbacks import CallbackManagerForLLMRun
-from langchain_core.language_models.llms import LLM
-from langchain_core.pydantic_v1 import Extra, root_validator
-from langchain_core.utils import get_from_dict_or_env
+from langchain_core.language_models.llms import LLM, BaseLLM
+from langchain_core.pydantic_v1 import Extra, root_validator, Field
+from langchain_core.utils import get_from_dict_or_env, get_pydantic_field_names, build_extra_kwargs
+from langchain_core.outputs import LLMResult, Generation
 
 from langchain_community.llms.utils import enforce_stop_tokens
 
@@ -149,3 +158,159 @@ class OctoAIEndpoint(LLM):
             text = enforce_stop_tokens(text, stop)
 
         return text
+
+def update_token_usage(
+    keys: Set[str], response: Dict[str, Any], token_usage: Dict[str, Any]
+) -> None:
+    """Update token usage."""
+    _keys_to_use = keys.intersection(response["usage"])
+    for _key in _keys_to_use:
+        if _key not in token_usage:
+            token_usage[_key] = response["usage"][_key]
+        else:
+            token_usage[_key] += response["usage"][_key]
+
+class OctoAI(BaseLLM):
+
+    endpoint_url: Optional[str] = None
+    """Endpoint URL to use."""
+    octoai_api_token: Optional[str] = None
+    """OCTOAI API Token"""
+    model_name: str = Field(default="codellama-7b-instruct-fp16", alias="model")
+    """Model name to use."""
+    temperature: float = 0.7
+    """What sampling temperature to use."""
+    max_tokens: int = 256
+    """The maximum number of tokens to generate in the completion."""
+    top_p: float = 1
+    """Total probability mass of tokens to consider at each step."""
+    frequency_penalty: float = 0
+    """Penalizes repeated tokens according to frequency."""
+    presence_penalty: float = 0
+    """Penalizes repeated tokens."""
+    n: int = 1
+    """How many completions to generate for each prompt."""
+    streaming: bool = False
+    """Whether to generate a stream of tokens asynchronously"""
+
+    model_kwargs: Dict[str, Any] = Field(default_factory=dict)
+
+    @root_validator(pre=True)
+    def build_extra(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Build extra kwargs from additional params that were passed in."""
+        all_required_field_names = get_pydantic_field_names(cls)
+        extra = values.get("model_kwargs", {})
+        values["model_kwargs"] = build_extra_kwargs(
+            extra, values, all_required_field_names
+        )
+        return values
+
+    @root_validator(allow_reuse=True)
+    def validate_environment(cls, values: Dict) -> Dict:
+        """Validate that api key and python package exists in environment."""
+        octoai_api_token = get_from_dict_or_env(
+            values, "octoai_api_token", "OCTOAI_API_TOKEN"
+        )
+        values["endpoint_url"] = get_from_dict_or_env(
+            values, "endpoint_url", "ENDPOINT_URL"
+        )
+
+        values["octoai_api_token"] = octoai_api_token
+        return values
+
+    @property
+    def _default_params(self) -> Dict[str, Any]:
+        """Get the default parameters for calling OpenAI API."""
+        normal_params: Dict[str, Any] = {
+            "model": self.model_name,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "n": self.n,
+        }
+
+        return {**normal_params, **self.model_kwargs}
+
+    def _generate(
+        self,
+        prompts: List[str],
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> LLMResult:
+        """Call out to OctoAI's endpoint with k unique prompts.
+
+        Args:
+            prompts: The prompts to pass into the model.
+            stop: Optional list of stop words to use when generating.
+
+        Returns:
+            The full LLM output.
+
+        """
+        params = self._invocation_params
+        params = {**params, **kwargs}
+        choices = []
+        token_usage: Dict[str, int] = {}
+        # Get the token usage from the response.
+        # Includes prompt, completion, and total tokens used.
+        _keys = {"completion_tokens", "prompt_tokens", "total_tokens"}
+        system_fingerprint: Optional[str] = None
+        for prompt in prompts:
+            if self.streaming:
+                raise ValueError("Haven't implemented yet")
+            else:
+                from octoai import client
+
+                octoai_client = client.Client(token=self.octoai_api_token)
+                params["messages"] = [{"role": "user", "content": prompt}]
+
+                response = octoai_client.infer(self.endpoint_url, params)
+                response_text = response.get("choices")[0].get("message").get("content")
+
+                if not isinstance(response, dict):
+                    response = response.dict()
+
+                choices.extend(response["choices"])
+                update_token_usage(_keys, response, token_usage)
+                if not system_fingerprint:
+                    system_fingerprint = response.get("id")
+        return self.create_llm_result(
+            choices,
+            prompts,
+            params,
+            token_usage,
+            system_fingerprint=system_fingerprint,
+        )
+
+    def create_llm_result(
+        self,
+        choices: Any,
+        prompts: List[str],
+        params: Dict[str, Any],
+        token_usage: Dict[str, int],
+        *,
+        system_fingerprint: Optional[str] = None,
+    ) -> LLMResult:
+        """Create the LLMResult from the choices and prompts."""
+        generations = []
+        n = params.get("n", self.n)
+        for i, _ in enumerate(prompts):
+            sub_choices = choices[i * n : (i + 1) * n]
+            generations.append(
+                [
+                    Generation(
+                        text=choice["content"],
+                        generation_info=dict(
+                            finish_reason=choice.get("finish_reason"),
+                        ),
+                    )
+                    for choice in sub_choices
+                ]
+            )
+        llm_output = {"token_usage": token_usage, "model_name": self.model_name}
+        if system_fingerprint:
+            llm_output["system_fingerprint"] = system_fingerprint
+        return LLMResult(generations=generations, llm_output=llm_output)
